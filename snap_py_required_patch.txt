@@ -1,0 +1,63 @@
+# Minimal required changes in snap.py
+
+# 1) In create_parser(), add:
+
+parser.add_argument(
+    '--raw-sc-dir',
+    default=None,
+    required=False,
+    help='directory containing raw single-cell BEDPE files used to aggregate pseudobulk backgrounds'
+)
+
+parser.add_argument(
+    '--stat-threshold',
+    default=None,
+    type=float,
+    required=False,
+    help='Wilcoxon statistic threshold. If provided, overrides --tstat-threshold.'
+)
+
+# 2) After args = parser.parse_args(), add:
+
+if args.stat_threshold is not None:
+    args.tstat_threshold = args.stat_threshold
+
+# 3) In the hic step, replace combine_cells(...) calls by adding binsize=args.binsize:
+
+combine_cells(
+    indir=rwr_dir, outdir=hic_dir, outlier_threshold=args.outlier,
+    chrom_lens=chrom_dict, rank=rank, n_proc=n_proc, logger=logger,
+    binsize=args.binsize
+)
+
+# threaded params also need binsize as the last argument:
+params = [
+    (rwr_dir, hic_dir, args.outlier, chrom_dict, i, n_proc, logger, args.binsize)
+    for i in range(n_proc)
+]
+
+# 4) In the postprocess(...) call, add raw_sc_dir=args.raw_sc_dir:
+
+postprocess(
+    indir=interaction_dir, outdir=postproc_dir, chrom_lens=chrom_dict,
+    fdr_thresh=args.fdr_threshold, gap_large=args.postproc_gap_large,
+    gap_small=args.postproc_gap_small, candidate_lower_thresh=args.candidate_lower_distance,
+    candidate_upper_thresh=args.candidate_upper_distance, binsize=args.binsize,
+    dist=args.dist, clustering_gap=args.clustering_gap, rank=rank,
+    n_proc=n_proc, max_mem=args.max_memory,
+    tstat_threshold=args.tstat_threshold,
+    circle_threshold_mult=args.circle_threshold_multiplier,
+    donut_threshold_mult=args.donut_threshold_multiplier,
+    lower_left_threshold_mult=args.lower_left_threshold_multiplier,
+    horizontal_threshold_mult=args.horizontal_threshold_multiplier,
+    vertical_threshold_mult=args.vertical_threshold_multiplier,
+    outlier_threshold_mult=args.outlier_threshold_multiplier,
+    filter_file=args.filter_file,
+    summit_gap=args.summit_gap,
+    logger=logger,
+    support_dir=use_support_dir,
+    support_filter=args.support_filter,
+    raw_sc_dir=args.raw_sc_dir
+)
+
+# threaded postprocess params also need args.raw_sc_dir as the final argument.
