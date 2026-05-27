@@ -2,16 +2,17 @@
 # -*- coding: utf-8 -*-
 
 import os
+import gc
+import sys
+import h5py
+import subprocess
+
 import numpy as np
 import scipy as sp
 from scipy import stats
 import pandas as pd
 import skimage
-import subprocess
 from statsmodels.stats.multitest import multipletests
-import gc
-import sys
-import h5py
 
 
 def get_proc_chroms(chrom_lens, rank, n_proc):
@@ -22,18 +23,18 @@ def get_proc_chroms(chrom_lens, rank, n_proc):
     chrom_names = [i[0] for i in chrom_list]
     indices = list(range(rank, len(chrom_names), n_proc))
     proc_chroms = [chrom_names[i] for i in indices]
+
     return proc_chroms
 
 
 def combine_chrom_interactions(directory):
     headers = "\t".join([
         "chr1", "x1", "x2", "chr2", "y1", "y2",
-        "outlier_count",
+        "support_cell_count",
         "case_avg",
         "control_avg",
         "pvalue",
         "stat",
-        "n_eff",
         "fdr_dist",
         "fdr_chrom",
     ])
@@ -61,12 +62,28 @@ def combine_chrom_interactions(directory):
 def determine_dense_matrix_size(num_cells, dist, binsize, max_mem):
     max_mem_floats = max_mem * 1e9
     max_mem_floats /= 8
+
     square_cells = max_mem_floats // num_cells
     mat_size = int(np.floor(np.sqrt(square_cells)) / 4)
-
     mat_size = max(int((dist // binsize) + 50), mat_size)
 
     return mat_size
+
+
+def _get_hdf_key(hdf_file, chrom):
+    if chrom in hdf_file:
+        return chrom
+
+    keynames = list(hdf_file.keys())
+    non_cell_keys = [k for k in keynames if k != "cellnames"]
+
+    if len(non_cell_keys) == 0:
+        raise KeyError(
+            "Cannot find matrix dataset in HDF file. "
+            f"Available keys: {keynames}"
+        )
+
+    return non_cell_keys[0]
 
 
 def convert_sparse_dataframe_to_dense_matrix(
@@ -78,16 +95,33 @@ def convert_sparse_dataframe_to_dense_matrix(
     num_cells,
     chrom_size,
     chrom_filename,
+    chrom,
     max_distance_bin,
     neighborhood_limit_lower,
 ):
+    """
+    将 combined BEDPE + cells.hdf 分块转换为 dense matrix。
+
+    关键修改：
+    1. interaction × cell 矩阵缺失值直接补 0。
+    2. 额外生成 target_pairs_local，只对原始 union interactions 做显著性检验。
+    3. 保留 SnapHiC 中 yield 相关的中间 print。
+    """
     d["i"] = (d.iloc[:, 1] // binsize).astype(int)
     d["j"] = (d.iloc[:, 4] // binsize).astype(int)
 
     max_distance_bin = dist // binsize
     chrom_bins = int(chrom_size // binsize)
 
-    for i in range(0, chrom_bins + 1, int(mat_size - max_distance_bin)):
+    step_size = int(mat_size - max_distance_bin)
+    if step_size <= 0:
+        raise ValueError(
+            "Invalid matrix block step size. "
+            f"mat_size={mat_size}, max_distance_bin={max_distance_bin}. "
+            "Please increase max_mem or decrease dist."
+        )
+
+    for i in range(0, chrom_bins + 1, step_size):
         matrix_upper_bound = max(0, i - upper_limit)
         matrix_lower_bound = min(i + mat_size + upper_limit, chrom_bins + 1)
 
@@ -98,18 +132,17 @@ def convert_sparse_dataframe_to_dense_matrix(
             )[0]
         )
 
-        d_portion = d.iloc[keeprows, 0:6].reset_index(drop=True)
-        d_portion.columns = ["chr1", "x1", "x2", "chr2", "y1", "y2"]
-
         if len(keeprows) == 0:
             continue
 
-        hdf_file = h5py.File(chrom_filename + ".cells.hdf", "r")
-        keynames = list(hdf_file.keys())
-        keyname = keynames[0] if keynames[0] != "cellnames" else keynames[1]
-        portion = hdf_file[keyname]
-        portion = portion[keeprows, :]
-        hdf_file.close()
+        d_keep = d.iloc[keeprows].copy()
+
+        d_portion = d_keep.iloc[:, 0:6].reset_index(drop=True)
+        d_portion.columns = ["chr1", "x1", "x2", "chr2", "y1", "y2"]
+
+        with h5py.File(chrom_filename + ".cells.hdf", "r") as hdf_file:
+            keyname = _get_hdf_key(hdf_file, chrom)
+            portion = hdf_file[keyname][keeprows, :]
 
         if portion.shape[0] == 0:
             continue
@@ -132,6 +165,8 @@ def convert_sparse_dataframe_to_dense_matrix(
 
         for cell_index in range(num_cells):
             cell_values = portion.iloc[:, 6 + cell_index]
+
+            # 原理上 interaction × cell 缺失直接补 0，不在检验阶段再做额外处理。
             cell_values = pd.to_numeric(cell_values, errors="coerce").fillna(0.0)
 
             cell_mat = sp.sparse.csr_matrix(
@@ -150,7 +185,7 @@ def convert_sparse_dataframe_to_dense_matrix(
 
             cell_mat = np.array(cell_mat.todense(), dtype=float)
 
-            # 下三角和对角线不参与计算
+            # 与 SnapHiC 一致：下三角和对角线不参与邻域计算。
             cell_mat[np.tril_indices(cell_mat.shape[0], 0)] = np.nan
 
             mat = np.expand_dims(cell_mat, 2)
@@ -184,6 +219,8 @@ def convert_sparse_dataframe_to_dense_matrix(
                 max_distance_bin,
             )
 
+            print("returned size", mat.shape, local_neighborhood.shape)
+
             local_neighborhoods.append(local_neighborhood)
             mats.append(mat)
 
@@ -191,7 +228,35 @@ def convert_sparse_dataframe_to_dense_matrix(
         mat_3d = np.stack(mats, axis=-1)
         mat_3d = np.squeeze(mat_3d)
 
-        yield mat_3d, local_neighborhoods, i
+        if mat_3d.ndim == 2:
+            mat_3d = mat_3d[:, :, np.newaxis]
+
+        if local_neighborhoods.ndim == 2:
+            local_neighborhoods = local_neighborhoods[:, :, np.newaxis]
+
+        target_pairs = d_keep[["i", "j"]].drop_duplicates().copy()
+        target_pairs["local_i"] = target_pairs["i"] - start_index
+        target_pairs["local_j"] = target_pairs["j"] - start_index
+
+        h, w = mat_3d.shape[:2]
+
+        target_pairs = target_pairs[
+            (target_pairs["local_i"] >= 0)
+            & (target_pairs["local_i"] < h)
+            & (target_pairs["local_j"] >= 0)
+            & (target_pairs["local_j"] < w)
+            & ((target_pairs["local_j"] - target_pairs["local_i"]) > 0)
+            & ((target_pairs["local_j"] - target_pairs["local_i"]) <= max_distance_bin)
+        ].copy()
+
+        target_pairs_local = target_pairs[["local_i", "local_j"]].astype(int).to_numpy()
+
+        if target_pairs_local.shape[0] == 0:
+            continue
+
+        print("yielding", mat_3d.shape, local_neighborhoods.shape)
+
+        yield mat_3d, local_neighborhoods, i, target_pairs_local
 
 
 def get_nth_diag_indices(mat, offset):
@@ -244,7 +309,6 @@ def get_mat_and_neighborhood(
 ):
     gc.collect()
 
-    # sliding window
     big_neighborhood = skimage.util.view_as_windows(
         mat,
         (2 * upper_limit + 1, 2 * upper_limit + 1, num_cells),
@@ -280,10 +344,12 @@ def get_mat_and_neighborhood(
     big_neighborhood_counts = np.sum(~np.isnan(big_neighborhood), axis=-1)
     small_neighborhood_counts = np.sum(~np.isnan(small_neighborhood), axis=-1)
 
+    print("big:", big_neighborhood.shape)
+    print("small:", small_neighborhood.shape)
+
     big_neighborhood = np.nansum(big_neighborhood, axis=-1)
     small_neighborhood = np.nansum(small_neighborhood, axis=-1)
 
-    # remove edge cases that are used only as neighbors
     trim_size = upper_limit - lower_limit
 
     small_neighborhood = small_neighborhood[
@@ -301,15 +367,26 @@ def get_mat_and_neighborhood(
     local_neighborhood = big_neighborhood - small_neighborhood
     local_neighborhood_counts = big_neighborhood_counts - small_neighborhood_counts
 
+    print(
+        "bn:",
+        big_neighborhood_counts,
+        "sn:",
+        small_neighborhood_counts,
+        "ln:",
+        local_neighborhood_counts,
+        "ul:",
+        upper_limit,
+        "ll:",
+        lower_limit,
+        "si:",
+        start_index,
+    )
+
     del small_neighborhood
     del big_neighborhood
     del big_neighborhood_counts
     del small_neighborhood_counts
     gc.collect()
-
-    # 避免除以 0
-    local_neighborhood_counts = local_neighborhood_counts.astype(float)
-    local_neighborhood_counts[local_neighborhood_counts == 0] = np.nan
 
     local_neighborhood = local_neighborhood / local_neighborhood_counts
 
@@ -319,56 +396,41 @@ def get_mat_and_neighborhood(
     return mat, local_neighborhood
 
 
-def _wilcoxon_one_position(x, y):
+def _wilcoxon_vectorized(case_values, control_values):
     """
-    对一个 interaction 的多个 pseudocell 值进行单边 Wilcoxon signed-rank test。
+    批量 Wilcoxon signed-rank test。
 
-    x:
-        center values across pseudocells
+    case_values:
+        shape = (n_interactions, n_cells)
 
-    y:
-        local background values across pseudocells
+    control_values:
+        shape = (n_interactions, n_cells)
 
-    H1:
-        x > y
-
-    返回：
-        stat, pvalue, n_eff
+    不在这里做 diff==0 或 NaN 清理。
+    interaction × cell 缺失已经在构建矩阵阶段补 0。
     """
-    x = np.asarray(x, dtype=float)
-    y = np.asarray(y, dtype=float)
-
-    mask = np.isfinite(x) & np.isfinite(y)
-
-    if mask.sum() == 0:
-        return 0.0, 1.0, 0
-
-    diff = x[mask] - y[mask]
-    diff = diff[np.isfinite(diff)]
-    diff = diff[diff != 0]
-
-    n_eff = int(diff.size)
-
-    if n_eff == 0:
-        return 0.0, 1.0, 0
-
     try:
-        stat, pvalue = stats.wilcoxon(
-            diff,
+        res = stats.wilcoxon(
+            case_values,
+            control_values,
+            axis=1,
             alternative="greater",
             zero_method="wilcox",
             correction=False,
             mode="auto",
         )
+
+        stat = np.asarray(res.statistic, dtype=float)
+        pvalue = np.asarray(res.pvalue, dtype=float)
+
     except Exception:
-        return 0.0, 1.0, n_eff
+        # 如果某些旧版 scipy 不支持 axis 参数，则明确报错，避免静默退回慢循环。
+        raise RuntimeError(
+            "Current scipy.stats.wilcoxon does not support vectorized axis=1. "
+            "Please upgrade scipy, e.g. scipy>=1.9, or use a newer conda environment."
+        )
 
-    if not np.isfinite(stat):
-        stat = 0.0
-    if not np.isfinite(pvalue):
-        pvalue = 1.0
-
-    return float(stat), float(pvalue), n_eff
+    return stat, pvalue
 
 
 def compute_significances(
@@ -379,21 +441,18 @@ def compute_significances(
     num_cells,
     start_index,
     max_distance_bin,
+    target_pairs_local,
 ):
     """
-    原始代码中这里使用：
-        stats.ttest_rel(mat, local_neighborhood, axis=2)
+    计算显著性。
 
-    现在改为：
-        one-sided Wilcoxon signed-rank test
-        H1: mat > local_neighborhood
-
-    其余矩阵化、分块、坐标转换逻辑保持原始结构。
+    关键修改：
+    1. 不再扫描 dense block 完整上三角。
+    2. 只对 combined BEDPE 中真实存在的 union interactions 做检验。
+    3. Wilcoxon 使用 scipy 的 axis=1 批量计算。
     """
+    print("in compute:", mat.shape, local_neighborhood.shape)
 
-    # ------------------------------------------------------------
-    # 1. 对每个矩阵位置计算 Wilcoxon
-    # ------------------------------------------------------------
     if mat.ndim == 2:
         mat = mat[:, :, np.newaxis]
 
@@ -402,95 +461,46 @@ def compute_significances(
 
     h, w, n_cells_actual = mat.shape
 
-    pvals = np.ones((h, w), dtype=float)
-    stat = np.zeros((h, w), dtype=float)
-    n_eff = np.zeros((h, w), dtype=np.int16)
+    rows = target_pairs_local[:, 0].astype(int)
+    cols = target_pairs_local[:, 1].astype(int)
 
-    upper_rows, upper_cols = np.triu_indices(h, k=1)
+    valid = (
+        (rows >= 0)
+        & (rows < h)
+        & (cols >= 0)
+        & (cols < w)
+        & ((cols - rows) > 0)
+        & ((cols - rows) <= max_distance_bin)
+    )
 
-    for r, c in zip(upper_rows, upper_cols):
-        if c - r > max_distance_bin:
-            continue
+    rows = rows[valid]
+    cols = cols[valid]
 
-        x = mat[r, c, :]
-        y = local_neighborhood[r, c, :]
+    if rows.size == 0:
+        return pd.DataFrame(
+            columns=["i", "j", "case_avg", "control_avg", "pvalue", "stat"]
+        )
 
-        s, p, n = _wilcoxon_one_position(x, y)
+    pair_df = pd.DataFrame({"row": rows, "col": cols}).drop_duplicates()
+    rows = pair_df["row"].to_numpy(dtype=int)
+    cols = pair_df["col"].to_numpy(dtype=int)
 
-        stat[r, c] = s
-        pvals[r, c] = p
-        n_eff[r, c] = n
+    case_values = mat[rows, cols, :]
+    control_values = local_neighborhood[rows, cols, :]
 
-    # ------------------------------------------------------------
-    # 2. 计算 case/control 平均值
-    # ------------------------------------------------------------
-    local_neighborhood_mean = np.nanmean(local_neighborhood, axis=-1)
-    mat_mean = np.nanmean(mat, axis=-1)
+    case_avg = np.mean(case_values, axis=1)
+    control_avg = np.mean(control_values, axis=1)
 
-    # ------------------------------------------------------------
-    # 3. 只保留上三角
-    # ------------------------------------------------------------
-    mat_mean = np.triu(mat_mean, 1)
-    local_neighborhood_mean = np.triu(local_neighborhood_mean, 1)
+    stat, pvalue = _wilcoxon_vectorized(case_values, control_values)
 
-    pvals = np.triu(pvals, 1)
-    pvals = np.nan_to_num(pvals, nan=1.0)
-
-    stat = np.triu(stat, 1)
-    stat = np.nan_to_num(stat, nan=0.0)
-
-    n_eff = np.triu(n_eff, 1)
-
-    # ------------------------------------------------------------
-    # 4. 转 dataframe
-    # ------------------------------------------------------------
-    mat_sparse = sp.sparse.coo_matrix(mat_mean)
-    local_sparse = sp.sparse.coo_matrix(local_neighborhood_mean)
-    pval_sparse = sp.sparse.coo_matrix(pvals)
-    stat_sparse = sp.sparse.coo_matrix(stat)
-    neff_sparse = sp.sparse.coo_matrix(n_eff)
-
-    result_mat = pd.DataFrame({
-        "i": mat_sparse.row,
-        "j": mat_sparse.col,
-        "case_avg": mat_sparse.data,
+    result = pd.DataFrame({
+        "i": rows + start_index,
+        "j": cols + start_index,
+        "case_avg": case_avg,
+        "control_avg": control_avg,
+        "pvalue": pvalue,
+        "stat": stat,
     })
-
-    result_neighb = pd.DataFrame({
-        "i": local_sparse.row,
-        "j": local_sparse.col,
-        "control_avg": local_sparse.data,
-    })
-
-    result_pval = pd.DataFrame({
-        "i": pval_sparse.row,
-        "j": pval_sparse.col,
-        "pvalue": pval_sparse.data,
-    })
-
-    result_stat = pd.DataFrame({
-        "i": stat_sparse.row,
-        "j": stat_sparse.col,
-        "stat": stat_sparse.data,
-    })
-
-    result_neff = pd.DataFrame({
-        "i": neff_sparse.row,
-        "j": neff_sparse.col,
-        "n_eff": neff_sparse.data,
-    })
-
-    result = result_mat.merge(result_neighb, on=["i", "j"], how="outer")
-    result = result.merge(result_pval, on=["i", "j"], how="outer")
-    result = result.merge(result_stat, on=["i", "j"], how="outer")
-    result = result.merge(result_neff, on=["i", "j"], how="outer")
-
-    result.loc[:, "pvalue"] = result["pvalue"].fillna(1.0)
-    result.loc[:, "stat"] = result["stat"].fillna(0.0)
-    result.loc[:, "n_eff"] = result["n_eff"].fillna(0).astype(int)
-
-    result.loc[:, "i"] += start_index
-    result.loc[:, "j"] += start_index
 
     result.loc[:, "i"] = result["i"].astype(int)
     result.loc[:, "j"] = result["j"].astype(int)
@@ -498,6 +508,29 @@ def compute_significances(
     result = result[result["j"] - result["i"] <= max_distance_bin]
 
     return result
+
+
+def _standardize_combined_columns(d):
+    if d.shape[1] < 7:
+        raise ValueError(
+            "Combined BEDPE must contain at least 7 columns: "
+            "chr1 x1 x2 chr2 y1 y2 support_cell_count"
+        )
+
+    d_main = d.iloc[:, list(range(7))].copy()
+
+    d_main.columns = [
+        "chr1", "x1", "x2",
+        "chr2", "y1", "y2",
+        "support_cell_count",
+    ]
+
+    d_main["support_cell_count"] = pd.to_numeric(
+        d_main["support_cell_count"],
+        errors="coerce",
+    ).fillna(0).astype(int)
+
+    return d_main
 
 
 def call_interactions(
@@ -536,12 +569,12 @@ def call_interactions(
             ".".join([chrom, "raw", "combined", "bedpe"]),
         )
 
-        # 如果新流程输出没有 raw 命名，则兼容 normalized 命名
         if not os.path.exists(chrom_filename):
             chrom_filename_alt = os.path.join(
                 indir,
                 ".".join([chrom, "normalized", "combined", "bedpe"]),
             )
+
             if os.path.exists(chrom_filename_alt):
                 chrom_filename = chrom_filename_alt
 
@@ -559,12 +592,8 @@ def call_interactions(
             )
 
         with h5py.File(hdf_filename, "r") as ifile:
-            if chrom in ifile:
-                num_cells = ifile[chrom].shape[1]
-            else:
-                keynames = list(ifile.keys())
-                keyname = keynames[0] if keynames[0] != "cellnames" else keynames[1]
-                num_cells = ifile[keyname].shape[1]
+            keyname = _get_hdf_key(ifile, chrom)
+            num_cells = ifile[keyname].shape[1]
 
         if logger:
             logger.write(
@@ -594,13 +623,20 @@ def call_interactions(
             num_cells,
             chrom_lens[chrom],
             chrom_filename,
+            chrom,
             max_distance_bin,
             neighborhood_limit_lower,
         )
 
         results = []
 
-        for i, (submatrix, local_neighborhood, start_index) in enumerate(submatrices):
+        for i, (
+            submatrix,
+            local_neighborhood,
+            start_index,
+            target_pairs_local,
+        ) in enumerate(submatrices):
+
             if logger:
                 logger.write(
                     f"\tprocessor {rank}: computing background for batch {i} of {chrom}, "
@@ -621,25 +657,37 @@ def call_interactions(
                 num_cells,
                 start_index,
                 max_distance_bin,
+                target_pairs_local,
             )
 
-            results.append(submat_result)
+            if submat_result.shape[0] > 0:
+                results.append(submat_result)
+
+        output_file = os.path.join(
+            outdir,
+            ".".join(["significances", chrom, "bedpe"]),
+        )
+
+        empty_cols = [
+            "chr1", "x1", "x2", "chr2", "y1", "y2",
+            "support_cell_count",
+            "case_avg",
+            "control_avg",
+            "pvalue",
+            "stat",
+            "fdr_dist",
+            "fdr_chrom",
+        ]
 
         if len(results) == 0:
-            empty_cols = [
-                "chr1", "x1", "x2", "chr2", "y1", "y2",
-                "outlier_count",
-                "case_avg", "control_avg", "pvalue", "stat", "n_eff",
-                "fdr_dist", "fdr_chrom",
-            ]
             pd.DataFrame(columns=empty_cols).to_csv(
-                os.path.join(outdir, ".".join(["significances", chrom, "bedpe"])),
+                output_file,
                 sep="\t",
                 index=False,
             )
             continue
 
-        results = pd.concat(results, axis=0)
+        results = pd.concat(results, axis=0, ignore_index=True)
 
         min_index = 0
         max_index = results["j"].max()
@@ -647,41 +695,60 @@ def call_interactions(
         results = results[
             (results["i"] >= min_index + neighborhood_limit_upper)
             & (results["j"] <= max_index - neighborhood_limit_upper)
-        ]
+        ].copy()
+
+        if results.shape[0] == 0:
+            pd.DataFrame(columns=empty_cols).to_csv(
+                output_file,
+                sep="\t",
+                index=False,
+            )
+            continue
 
         def compute_fdr_by_dist(dsub):
+            dsub = dsub.copy()
             fdrs = multipletests(list(dsub["pvalue"]), method="fdr_bh")[1]
             dsub.loc[:, "fdr_dist"] = fdrs
             return dsub
 
         results.reset_index(drop=True, inplace=True)
 
-        if results.shape[0] > 0:
-            results = results.groupby(
-                results["j"] - results["i"],
-                as_index=False,
-            ).apply(compute_fdr_by_dist)
+        results = results.groupby(
+            results["j"] - results["i"],
+            group_keys=False,
+        ).apply(compute_fdr_by_dist)
 
-            results.loc[:, "fdr_chrom"] = multipletests(
-                list(results["pvalue"]),
-                method="fdr_bh",
-            )[1]
-        else:
-            results["fdr_dist"] = []
-            results["fdr_chrom"] = []
+        results.loc[:, "fdr_chrom"] = multipletests(
+            list(results["pvalue"]),
+            method="fdr_bh",
+        )[1]
 
         results.loc[:, "i"] = (results["i"] * binsize).astype(int)
         results.loc[:, "j"] = (results["j"] * binsize).astype(int)
 
-        d = d.iloc[:, list(range(7))]
-        d.columns = [
-            "chr1", "x1", "x2",
-            "chr2", "y1", "y2",
-            "outlier_count",
-        ]
+        d_out = _standardize_combined_columns(d)
 
-        d = d.merge(results, left_on=["x1", "y1"], right_on=["i", "j"])
-        d.drop(["i", "j"], axis=1, inplace=True)
+        d_out = d_out.merge(
+            results,
+            left_on=["x1", "y1"],
+            right_on=["i", "j"],
+            how="inner",
+        )
+
+        d_out.drop(["i", "j"], axis=1, inplace=True)
+
+        d_out = d_out[
+            [
+                "chr1", "x1", "x2", "chr2", "y1", "y2",
+                "support_cell_count",
+                "case_avg",
+                "control_avg",
+                "pvalue",
+                "stat",
+                "fdr_dist",
+                "fdr_chrom",
+            ]
+        ]
 
         if logger:
             logger.write(
@@ -691,8 +758,8 @@ def call_interactions(
                 verbose_level=2,
             )
 
-        d.to_csv(
-            os.path.join(outdir, ".".join(["significances", chrom, "bedpe"])),
+        d_out.to_csv(
+            output_file,
             sep="\t",
             index=False,
         )

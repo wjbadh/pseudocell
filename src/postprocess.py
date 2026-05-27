@@ -1,56 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-"""
-postprocess.py
-
-Postprocessing for raw-count pseudocell Hi-C loop calling.
-
-本版本适配 pseudocell_hic.py：
-
-主要流程：
-  1. 读取 interactions/significances.{chrom}.bedpe。
-  2. 从预生成的 pseudobulk .hic 文件读取对应染色体 contact map。
-  3. 基于 .hic contact map 计算五类结构背景：
-       circle
-       donut
-       lower_left
-       horizontal
-       vertical
-  4. 根据 FDR、Wilcoxon stat、距离范围、support_fraction、五类结构背景过滤，
-     生成 candidates.{chrom}.bedpe。
-  5. 如果 support_filter=True：
-       进一步基于 pseudocell raw BEDPE 计算半径 support filter；
-       输出 candidate_support.{chrom}.bedpe；
-       输出 candidates_filter.{chrom}.bedpe；
-       聚类使用 candidates_filter.{chrom}.bedpe。
-     如果 support_filter=False：
-       聚类使用 candidates.{chrom}.bedpe。
-  6. 聚类生成 clustered.candidates.{chrom}.bedpe。
-  7. 合并所有染色体结果生成：
-       {prefix}.postprocessed.all_candidates.bedpe
-       {prefix}.postprocessed.summits.bedpe
-
-依赖：
-  优先使用 hicstraw 读取 .hic。
-  需要在环境中安装：
-      pip install hic-straw
-
-说明：
-  support_filter 不能从 pseudobulk .hic 读取，因为它需要每个 pseudocell 各自的半径窗口有效 interaction 数量。
-"""
-
 import os
 import sys
 import glob
-import math
 import numpy as np
 import pandas as pd
 
-
-# ============================================================
-# Optional import: support filter
-# ============================================================
 
 try:
     from src.prefilter_support import filter_candidate_dir_by_pseudocell_support
@@ -61,38 +17,25 @@ except ImportError:
         filter_candidate_dir_by_pseudocell_support = None
 
 
-# ============================================================
-# Optional import: hicstraw
-# ============================================================
-
 try:
     import hicstraw
 except ImportError:
     hicstraw = None
 
 
-# ============================================================
-# Constants
-# ============================================================
-
 BEDPE6_COLS = ["chr1", "x1", "x2", "chr2", "y1", "y2"]
 
-DEFAULT_SIGNIF_COLS = [
+SIGNIF_COLS = [
     "chr1", "x1", "x2", "chr2", "y1", "y2",
-    "center_value",
-    "background_mean",
-    "stat",
-    "n_eff",
+    "support_cell_count",
+    "case_avg",
+    "control_avg",
     "pvalue",
-    "qvalue",
-    "support_fraction",
-    "distance",
+    "stat",
+    "fdr_dist",
+    "fdr_chrom",
 ]
 
-
-# ============================================================
-# Logging
-# ============================================================
 
 def _log(logger, msg, rank=0, v=1):
     if logger is not None:
@@ -112,22 +55,13 @@ def _log(logger, msg, rank=0, v=1):
         print(msg, file=sys.stderr, flush=True)
 
 
-# ============================================================
-# Basic helpers
-# ============================================================
-
 def get_proc_chroms(chrom_lens, rank, n_proc):
-    """
-    按染色体长度从大到小分配给不同 rank，保留 SnapHiC 风格并行逻辑。
-    """
     chrom_list = [(k, chrom_lens[k]) for k in list(chrom_lens.keys())]
     chrom_list.sort(key=lambda x: x[1], reverse=True)
 
     chrom_names = [x[0] for x in chrom_list]
     indices = list(range(rank, len(chrom_names), n_proc))
-    proc_chroms = [chrom_names[i] for i in indices]
-
-    return proc_chroms
+    return [chrom_names[i] for i in indices]
 
 
 def _safe_numeric(s, default=0.0):
@@ -141,65 +75,41 @@ def _ensure_bedpe_numeric(df):
     return df
 
 
-def _standardize_bedpe_columns(df):
-    """
-    标准化 significances 文件列名。
+def count_pseudocell_files_for_chrom(pseudocell_dir, chrom, pattern="*.bedpe*"):
+    if pseudocell_dir is None:
+        raise ValueError("[postprocess] pseudocell_dir is required to count num_cells")
 
-    如果文件已有 header，则保留原列名。
-    如果没有 header，则使用 DEFAULT_SIGNIF_COLS + extra_col。
-    """
-    if df.shape[0] == 0:
-        return pd.DataFrame(columns=DEFAULT_SIGNIF_COLS)
+    files = []
 
-    first_vals = [str(x) for x in df.iloc[0, : min(df.shape[1], 6)].tolist()]
-    looks_header = any(x in {"chr1", "x1", "x2", "chr2", "y1", "y2"} for x in first_vals)
+    for fp in glob.glob(os.path.join(pseudocell_dir, pattern)):
+        if os.path.isdir(fp):
+            continue
 
-    if looks_header:
-        df.columns = df.iloc[0].astype(str).tolist()
-        df = df.iloc[1:, :].copy()
-        return df.reset_index(drop=True)
+        base = os.path.basename(fp)
 
-    ncol = df.shape[1]
-    if ncol <= len(DEFAULT_SIGNIF_COLS):
-        cols = DEFAULT_SIGNIF_COLS[:ncol]
-    else:
-        cols = DEFAULT_SIGNIF_COLS + [f"extra_{i}" for i in range(ncol - len(DEFAULT_SIGNIF_COLS))]
+        if (
+            f".{chrom}." in base
+            or base.endswith(f".{chrom}.bedpe")
+            or base.endswith(f".{chrom}.bedpe.gz")
+            or f"_{chrom}_" in base
+            or f"_{chrom}." in base
+            or f".{chrom}_" in base
+        ):
+            files.append(fp)
 
-    df.columns = cols
-    return df
+    if len(files) == 0:
+        files = [
+            fp for fp in glob.glob(os.path.join(pseudocell_dir, f"*{chrom}*.bedpe*"))
+            if os.path.isfile(fp)
+        ]
 
+    return len(files)
 
-def infer_column(df, candidates, required=False, default=None):
-    for c in candidates:
-        if c in df.columns:
-            return c
-
-    if required:
-        raise KeyError(f"None of candidate columns found: {candidates}")
-
-    return default
-
-
-# ============================================================
-# Filter regions
-# ============================================================
 
 def read_filter_regions(filter_file, binsize):
-    """
-    读取 blacklist/filter regions。
-
-    支持：
-      1. chr start end
-      2. chr bin
-    返回：
-      set((chrom, bin_id))
-    """
     bad = set()
 
-    if filter_file is None:
-        return bad
-
-    if not os.path.exists(filter_file):
+    if filter_file is None or not os.path.exists(filter_file):
         return bad
 
     try:
@@ -211,10 +121,10 @@ def read_filter_regions(filter_file, binsize):
         return bad
 
     if df.shape[1] >= 3:
-        for _, row in df.iterrows():
-            chrom = str(row.iloc[0])
-            start = int(row.iloc[1])
-            end = int(row.iloc[2])
+        for row in df.itertuples(index=False):
+            chrom = str(row[0])
+            start = int(row[1])
+            end = int(row[2])
 
             b1 = start // int(binsize)
             b2 = max(start, end - 1) // int(binsize)
@@ -223,48 +133,30 @@ def read_filter_regions(filter_file, binsize):
                 bad.add((chrom, b))
 
     elif df.shape[1] >= 2:
-        for _, row in df.iterrows():
-            chrom = str(row.iloc[0])
-            b = int(row.iloc[1])
-            bad.add((chrom, b))
+        for row in df.itertuples(index=False):
+            bad.add((str(row[0]), int(row[1])))
 
     return bad
 
 
 def apply_filter_regions(df, filter_regions, binsize):
-    """
-    删除任一 anchor 落入 blacklist/filter region 的 interaction。
-    """
     if df.shape[0] == 0 or len(filter_regions) == 0:
         return df
 
-    keep = []
+    b1 = (df["x1"].astype(np.int64) // int(binsize)).to_numpy()
+    b2 = (df["y1"].astype(np.int64) // int(binsize)).to_numpy()
+    chr1 = df["chr1"].astype(str).to_numpy()
+    chr2 = df["chr2"].astype(str).to_numpy()
 
-    for _, row in df.iterrows():
-        chrom1 = str(row["chr1"])
-        chrom2 = str(row["chr2"])
+    keep = np.ones(df.shape[0], dtype=bool)
 
-        b1 = int(row["x1"]) // int(binsize)
-        b2 = int(row["y1"]) // int(binsize)
+    for idx in range(df.shape[0]):
+        if (chr1[idx], int(b1[idx])) in filter_regions:
+            keep[idx] = False
+        elif (chr2[idx], int(b2[idx])) in filter_regions:
+            keep[idx] = False
 
-        if (chrom1, b1) in filter_regions or (chrom2, b2) in filter_regions:
-            keep.append(False)
-        else:
-            keep.append(True)
-
-    return df.loc[np.asarray(keep, dtype=bool)].copy()
-
-
-# ============================================================
-# .hic reader
-# ============================================================
-
-def _normalize_chrom_name_for_hic(chrom):
-    """
-    hicstraw 通常可以接受 chr1；这里保留原名。
-    如果用户 .hic 中染色体没有 chr 前缀，需要自行保证 CHROMS 与 .hic 一致。
-    """
-    return str(chrom)
+    return df.loc[keep].copy()
 
 
 def load_hic_contact_map(
@@ -276,24 +168,14 @@ def load_hic_contact_map(
     logger=None,
     rank=0,
 ):
-    """
-    从 pseudobulk .hic 中读取单染色体 contact map。
-
-    返回：
-      dict[(bin_i, bin_j)] = count
-
-    其中 bin_i/bin_j 是 binsize 对应的 bin index。
-    """
     if hicstraw is None:
         raise ImportError(
             "hicstraw is required for reading .hic files. "
-            "Install it with: pip install hic-straw"
+            "Install with: pip install hic-straw"
         )
 
     if not os.path.exists(hic_path):
         raise FileNotFoundError(f"[postprocess] pseudobulk .hic not found: {hic_path}")
-
-    chrom_hic = _normalize_chrom_name_for_hic(chrom)
 
     _log(
         logger,
@@ -303,12 +185,15 @@ def load_hic_contact_map(
     )
 
     try:
-        result = hicstraw.straw(
-            normalization,
-            hic_path,
-            chrom_hic,
-            chrom_hic,
-            unit,
+        # 当前环境 hicstraw 的正确顺序：
+        # straw(observed/oe/expected, normalization, hic, chr1, chr2, BP/FRAG, binsize)
+        records = hicstraw.straw(
+            "observed",
+            str(normalization),
+            str(hic_path),
+            str(chrom),
+            str(chrom),
+            str(unit),
             int(binsize),
         )
     except Exception as e:
@@ -320,9 +205,7 @@ def load_hic_contact_map(
 
     contact = {}
 
-    for rec in result:
-        # hicstraw record fields:
-        # rec.binX, rec.binY, rec.counts
+    for rec in records:
         i = int(rec.binX) // int(binsize)
         j = int(rec.binY) // int(binsize)
 
@@ -334,10 +217,8 @@ def load_hic_contact_map(
 
         v = float(rec.counts)
 
-        if v == 0:
-            continue
-
-        contact[(i, j)] = contact.get((i, j), 0.0) + v
+        if v != 0:
+            contact[(i, j)] = contact.get((i, j), 0.0) + v
 
     _log(
         logger,
@@ -362,45 +243,7 @@ def get_contact_value(contact_map, i, j):
     return float(contact_map.get((i, j), 0.0))
 
 
-# ============================================================
-# Structural background from .hic
-# ============================================================
-
 def compute_structural_backgrounds_for_pair(contact_map, i, j, gap_large, gap_small):
-    """
-    计算五类结构背景。
-
-    输入：
-      contact_map:
-        dict[(bin_i, bin_j)] = count
-
-      i, j:
-        中心 interaction 的 bin 坐标。
-
-      gap_large:
-        大窗口半径，单位 bin。
-
-      gap_small:
-        中心排除窗口半径，单位 bin。
-
-    背景定义：
-      donut:
-        大方形窗口中排除中心小窗口后的所有点。
-
-      circle:
-        这里保留为独立字段。
-        当前实现使用与 donut 相同的候选区域，便于通过 multiplier 独立调参。
-        如果你后续要严格复刻原 SnapHiC circle 几何形状，可以只改这个函数。
-
-      horizontal:
-        固定左 anchor i，沿右 anchor j 方向取背景，排除中心小窗口。
-
-      vertical:
-        固定右 anchor j，沿左 anchor i 方向取背景，排除中心小窗口。
-
-      lower_left:
-        两个 anchor 同时向左下方向移动的局部背景。
-    """
     i = int(i)
     j = int(j)
 
@@ -412,11 +255,10 @@ def compute_structural_backgrounds_for_pair(contact_map, i, j, gap_large, gap_sm
 
     circle_vals = []
     donut_vals = []
+    lower_left_vals = []
     horizontal_vals = []
     vertical_vals = []
-    lower_left_vals = []
 
-    # donut / circle
     for di in range(-gl, gl + 1):
         for dj in range(-gl, gl + 1):
             if abs(di) <= gs and abs(dj) <= gs:
@@ -425,16 +267,20 @@ def compute_structural_backgrounds_for_pair(contact_map, i, j, gap_large, gap_sm
             a = i + di
             b = j + dj
 
-            if a < 0 or b < 0:
-                continue
-            if a >= b:
+            if a < 0 or b < 0 or a >= b:
                 continue
 
             v = get_contact_value(contact_map, a, b)
-            donut_vals.append(v)
             circle_vals.append(v)
+            donut_vals.append(v)
 
-    # horizontal
+    for d in range(gs + 1, gl + 1):
+        a = i - d
+        b = j - d
+
+        if a >= 0 and b >= 0 and a < b:
+            lower_left_vals.append(get_contact_value(contact_map, a, b))
+
     for dj in range(-gl, gl + 1):
         if abs(dj) <= gs:
             continue
@@ -442,14 +288,9 @@ def compute_structural_backgrounds_for_pair(contact_map, i, j, gap_large, gap_sm
         a = i
         b = j + dj
 
-        if a < 0 or b < 0:
-            continue
-        if a >= b:
-            continue
+        if a >= 0 and b >= 0 and a < b:
+            horizontal_vals.append(get_contact_value(contact_map, a, b))
 
-        horizontal_vals.append(get_contact_value(contact_map, a, b))
-
-    # vertical
     for di in range(-gl, gl + 1):
         if abs(di) <= gs:
             continue
@@ -457,37 +298,19 @@ def compute_structural_backgrounds_for_pair(contact_map, i, j, gap_large, gap_sm
         a = i + di
         b = j
 
-        if a < 0 or b < 0:
-            continue
-        if a >= b:
-            continue
+        if a >= 0 and b >= 0 and a < b:
+            vertical_vals.append(get_contact_value(contact_map, a, b))
 
-        vertical_vals.append(get_contact_value(contact_map, a, b))
+    def mean0(vals):
+        return float(np.mean(vals)) if len(vals) > 0 else 0.0
 
-    # lower-left diagonal
-    for d in range(gs + 1, gl + 1):
-        a = i - d
-        b = j - d
-
-        if a < 0 or b < 0:
-            continue
-        if a >= b:
-            continue
-
-        lower_left_vals.append(get_contact_value(contact_map, a, b))
-
-    def mean_or_zero(vals):
-        if len(vals) == 0:
-            return 0.0
-        return float(np.mean(vals))
-
-    return {
-        "circle": mean_or_zero(circle_vals),
-        "donut": mean_or_zero(donut_vals),
-        "lower_left": mean_or_zero(lower_left_vals),
-        "horizontal": mean_or_zero(horizontal_vals),
-        "vertical": mean_or_zero(vertical_vals),
-    }
+    return (
+        mean0(circle_vals),
+        mean0(donut_vals),
+        mean0(lower_left_vals),
+        mean0(horizontal_vals),
+        mean0(vertical_vals),
+    )
 
 
 def add_structural_background_columns_from_hic(
@@ -497,15 +320,6 @@ def add_structural_background_columns_from_hic(
     gap_large,
     gap_small,
 ):
-    """
-    给 significance/candidate DataFrame 增加：
-      pseudobulk_center
-      circle
-      donut
-      lower_left
-      horizontal
-      vertical
-    """
     df = df.copy()
 
     if df.shape[0] == 0:
@@ -520,23 +334,28 @@ def add_structural_background_columns_from_hic(
             df[c] = []
         return df
 
-    centers = np.zeros(df.shape[0], dtype=float)
-    circles = np.zeros(df.shape[0], dtype=float)
-    donuts = np.zeros(df.shape[0], dtype=float)
-    lower_lefts = np.zeros(df.shape[0], dtype=float)
-    horizontals = np.zeros(df.shape[0], dtype=float)
-    verticals = np.zeros(df.shape[0], dtype=float)
+    n = df.shape[0]
 
-    for idx, (_, row) in enumerate(df.iterrows()):
-        i = int(row["x1"]) // int(binsize)
-        j = int(row["y1"]) // int(binsize)
+    centers = np.zeros(n, dtype=float)
+    circles = np.zeros(n, dtype=float)
+    donuts = np.zeros(n, dtype=float)
+    lower_lefts = np.zeros(n, dtype=float)
+    horizontals = np.zeros(n, dtype=float)
+    verticals = np.zeros(n, dtype=float)
+
+    x_bins = (df["x1"].astype(np.int64) // int(binsize)).to_numpy()
+    y_bins = (df["y1"].astype(np.int64) // int(binsize)).to_numpy()
+
+    for idx in range(n):
+        i = int(x_bins[idx])
+        j = int(y_bins[idx])
 
         if i > j:
             i, j = j, i
 
         centers[idx] = get_contact_value(contact_map, i, j)
 
-        bg = compute_structural_backgrounds_for_pair(
+        circle, donut, lower_left, horizontal, vertical = compute_structural_backgrounds_for_pair(
             contact_map=contact_map,
             i=i,
             j=j,
@@ -544,11 +363,11 @@ def add_structural_background_columns_from_hic(
             gap_small=gap_small,
         )
 
-        circles[idx] = bg["circle"]
-        donuts[idx] = bg["donut"]
-        lower_lefts[idx] = bg["lower_left"]
-        horizontals[idx] = bg["horizontal"]
-        verticals[idx] = bg["vertical"]
+        circles[idx] = circle
+        donuts[idx] = donut
+        lower_lefts[idx] = lower_left
+        horizontals[idx] = horizontal
+        verticals[idx] = vertical
 
     df["pseudobulk_center"] = centers
     df["circle"] = circles
@@ -560,18 +379,9 @@ def add_structural_background_columns_from_hic(
     return df
 
 
-# ============================================================
-# Significance file reading
-# ============================================================
-
 def read_significance_file(path):
-    """
-    读取 significances.{chrom}.bedpe。
-
-    支持有 header 或无 header。
-    """
     if not os.path.exists(path):
-        return pd.DataFrame(columns=DEFAULT_SIGNIF_COLS)
+        return pd.DataFrame(columns=SIGNIF_COLS)
 
     compression = "gzip" if str(path).endswith(".gz") else None
 
@@ -584,20 +394,29 @@ def read_significance_file(path):
             low_memory=False,
         )
     except pd.errors.EmptyDataError:
-        return pd.DataFrame(columns=DEFAULT_SIGNIF_COLS)
+        return pd.DataFrame(columns=SIGNIF_COLS)
 
     if df.shape[0] == 0:
-        return pd.DataFrame(columns=DEFAULT_SIGNIF_COLS)
+        return pd.DataFrame(columns=SIGNIF_COLS)
 
-    df = _standardize_bedpe_columns(df)
+    first_vals = [str(x) for x in df.iloc[0, : min(df.shape[1], 6)].tolist()]
+    has_header = any(x in {"chr1", "x1", "x2", "chr2", "y1", "y2"} for x in first_vals)
+
+    if has_header:
+        df.columns = df.iloc[0].astype(str).tolist()
+        df = df.iloc[1:, :].copy()
+    else:
+        if df.shape[1] < len(SIGNIF_COLS):
+            raise ValueError(
+                f"[postprocess] {path} has {df.shape[1]} columns, "
+                f"expected at least {len(SIGNIF_COLS)}"
+            )
+        df = df.iloc[:, :len(SIGNIF_COLS)].copy()
+        df.columns = SIGNIF_COLS
+
     df = _ensure_bedpe_numeric(df)
+    return df.reset_index(drop=True)
 
-    return df
-
-
-# ============================================================
-# Candidate filtering
-# ============================================================
 
 def apply_candidate_filters(
     df,
@@ -612,94 +431,59 @@ def apply_candidate_filters(
     lower_left_threshold_mult,
     horizontal_threshold_mult,
     vertical_threshold_mult,
+    num_cells,
 ):
-    """
-    应用 candidate 过滤条件。
-
-    注意：
-      stat_threshold 直接使用用户输入的 args.stat_threshold。
-      本函数不对 Wilcoxon statistic 做自适应转换。
-    """
     if df.shape[0] == 0:
         return df
 
+    required_cols = [
+        "chr1", "x1", "x2", "chr2", "y1", "y2",
+        "support_cell_count",
+        "pvalue",
+        "stat",
+        "fdr_dist",
+        "pseudobulk_center",
+        "circle",
+        "donut",
+        "lower_left",
+        "horizontal",
+        "vertical",
+    ]
+
+    missing = [c for c in required_cols if c not in df.columns]
+    if len(missing) > 0:
+        raise KeyError(
+            "[postprocess] missing required columns: " + ",".join(missing)
+        )
+
+    if num_cells is None or int(num_cells) <= 0:
+        raise ValueError("[postprocess] num_cells must be positive")
+
     df = df.copy()
 
-    q_col = infer_column(df, ["qvalue", "qval", "fdr", "FDR", "padj", "adj_pvalue"], required=False)
-    p_col = infer_column(df, ["pvalue", "pval", "p", "P"], required=False)
-    stat_col = infer_column(df, ["stat", "wilcoxon_stat", "tstat", "t_stat"], required=False)
-    support_col = infer_column(
-        df,
-        ["support_fraction", "support_frac", "cell_fraction", "pseudocell_fraction"],
-        required=False,
-    )
+    df["support_cell_count"] = _safe_numeric(df["support_cell_count"], default=0.0)
+    df["pvalue"] = _safe_numeric(df["pvalue"], default=1.0)
+    df["stat"] = _safe_numeric(df["stat"], default=0.0)
+    df["fdr_dist"] = _safe_numeric(df["fdr_dist"], default=1.0)
 
-    # FDR / p-value
-    if q_col is not None:
-        df[q_col] = _safe_numeric(df[q_col], default=1.0)
-        keep_fdr = df[q_col] <= float(fdr_thresh)
-    elif p_col is not None:
-        df[p_col] = _safe_numeric(df[p_col], default=1.0)
-        keep_fdr = df[p_col] <= float(fdr_thresh)
-    else:
-        keep_fdr = pd.Series(True, index=df.index)
-
-    # Wilcoxon statistic
-    if stat_col is not None:
-        df[stat_col] = _safe_numeric(df[stat_col], default=0.0)
-        keep_stat = df[stat_col] >= float(stat_threshold)
-    else:
-        keep_stat = pd.Series(True, index=df.index)
-
-    # center support fraction from interaction step
-    if support_col is not None:
-        df[support_col] = _safe_numeric(df[support_col], default=0.0)
-        keep_support = df[support_col] >= float(min_support_fraction)
-    else:
-        keep_support = pd.Series(True, index=df.index)
-
-    # distance
-    if "distance" in df.columns:
-        df["distance"] = _safe_numeric(df["distance"], default=0.0)
-        dist_bp = df["distance"]
-    else:
-        dist_bp = (df["y1"].astype(np.int64) - df["x1"].astype(np.int64)).abs()
-
-    keep_distance = (
-        (dist_bp >= float(candidate_lower_thresh)) &
-        (dist_bp <= float(candidate_upper_thresh))
-    )
-
-    # structural background filters
     for c in ["pseudobulk_center", "circle", "donut", "lower_left", "horizontal", "vertical"]:
-        if c in df.columns:
-            df[c] = _safe_numeric(df[c], default=0.0)
+        df[c] = _safe_numeric(df[c], default=0.0)
 
-    if "pseudobulk_center" in df.columns:
-        center = df["pseudobulk_center"]
-
-        keep_circle = center > df["circle"] * float(circle_threshold_mult)
-        keep_donut = center > df["donut"] * float(donut_threshold_mult)
-        keep_lower_left = center > df["lower_left"] * float(lower_left_threshold_mult)
-        keep_horizontal = center > df["horizontal"] * float(horizontal_threshold_mult)
-        keep_vertical = center > df["vertical"] * float(vertical_threshold_mult)
-    else:
-        keep_circle = pd.Series(True, index=df.index)
-        keep_donut = pd.Series(True, index=df.index)
-        keep_lower_left = pd.Series(True, index=df.index)
-        keep_horizontal = pd.Series(True, index=df.index)
-        keep_vertical = pd.Series(True, index=df.index)
+    dist_bp = (df["y1"].astype(np.int64) - df["x1"].astype(np.int64)).abs()
+    center = df["pseudobulk_center"]
 
     keep = (
-        keep_fdr &
-        keep_stat &
-        keep_support &
-        keep_distance &
-        keep_circle &
-        keep_donut &
-        keep_lower_left &
-        keep_horizontal &
-        keep_vertical
+        (dist_bp >= float(candidate_lower_thresh)) &
+        (dist_bp <= float(candidate_upper_thresh)) &
+        (center > 0) &
+        (df["stat"] >= float(stat_threshold)) &
+        (df["fdr_dist"] <= float(fdr_thresh)) &
+        (df["support_cell_count"] > float(min_support_fraction) * float(num_cells)) &
+        (center > df["circle"] * float(circle_threshold_mult)) &
+        (center > df["donut"] * float(donut_threshold_mult)) &
+        (center > df["lower_left"] * float(lower_left_threshold_mult)) &
+        (center > df["horizontal"] * float(horizontal_threshold_mult)) &
+        (center > df["vertical"] * float(vertical_threshold_mult))
     )
 
     return df.loc[keep].copy()
@@ -730,14 +514,13 @@ def find_candidates(
     rank=0,
     pseudobulk_hic=None,
     hic_normalization="NONE",
+    pseudocell_dir=None,
+    pseudocell_pattern="*.bedpe*",
 ):
-    """
-    对每个 chromosome 生成 candidates.{chrom}.bedpe。
-    """
     os.makedirs(outdir, exist_ok=True)
 
     if pseudobulk_hic is None:
-        raise ValueError("[postprocess] --pseudobulk-hic is required for postprocess")
+        raise ValueError("[postprocess] --pseudobulk-hic is required")
 
     filter_regions = read_filter_regions(filter_file, binsize)
 
@@ -756,14 +539,23 @@ def find_candidates(
             continue
 
         sig = _ensure_bedpe_numeric(sig)
-
-        # intra-chrom only
         sig = sig[(sig["chr1"].astype(str) == chrom) & (sig["chr2"].astype(str) == chrom)].copy()
 
         if sig.shape[0] == 0:
             sig.to_csv(outfile_nofilter, sep="\t", index=False)
             sig.to_csv(outfile_candidates, sep="\t", index=False)
             continue
+
+        num_cells = count_pseudocell_files_for_chrom(
+            pseudocell_dir=pseudocell_dir,
+            chrom=chrom,
+            pattern=pseudocell_pattern,
+        )
+
+        if num_cells <= 0:
+            raise ValueError(
+                f"[postprocess] cannot determine num_cells for {chrom} from {pseudocell_dir}"
+            )
 
         contact_map = load_hic_contact_map(
             hic_path=pseudobulk_hic,
@@ -784,7 +576,6 @@ def find_candidates(
         )
 
         sig = apply_filter_regions(sig, filter_regions, binsize)
-
         sig.to_csv(outfile_nofilter, sep="\t", index=False)
 
         cand = apply_candidate_filters(
@@ -800,21 +591,19 @@ def find_candidates(
             lower_left_threshold_mult=lower_left_threshold_mult,
             horizontal_threshold_mult=horizontal_threshold_mult,
             vertical_threshold_mult=vertical_threshold_mult,
+            num_cells=num_cells,
         )
 
         cand.to_csv(outfile_candidates, sep="\t", index=False)
 
         _log(
             logger,
-            f"\tprocessor {rank}: {chrom} candidates {sig.shape[0]} -> {cand.shape[0]}",
+            f"\tprocessor {rank}: {chrom} candidates {sig.shape[0]} -> {cand.shape[0]} "
+            f"(num_cells={num_cells})",
             rank=rank,
             v=2,
         )
 
-
-# ============================================================
-# Clustering
-# ============================================================
 
 def _get_bin_pair(row, binsize):
     i = int(row["x1"]) // int(binsize)
@@ -827,88 +616,32 @@ def _get_bin_pair(row, binsize):
 
 
 def _choose_summit(cluster_df):
-    """
-    从一个 cluster 中选择 summit。
-
-    优先级：
-      1. qvalue / fdr 最小
-      2. stat 最大
-      3. pseudobulk_center 最大
-      4. center_value 最大
-    """
     df = cluster_df.copy()
 
-    sort_cols = []
-    ascending = []
+    df["fdr_dist"] = _safe_numeric(df["fdr_dist"], default=1.0)
+    df["stat"] = _safe_numeric(df["stat"], default=0.0)
+    df["pseudobulk_center"] = _safe_numeric(df["pseudobulk_center"], default=0.0)
 
-    for c in ["qvalue", "qval", "fdr", "FDR", "padj", "adj_pvalue"]:
-        if c in df.columns:
-            df[c] = _safe_numeric(df[c], default=1.0)
-            sort_cols.append(c)
-            ascending.append(True)
-            break
-
-    for c in ["stat", "wilcoxon_stat", "tstat", "t_stat"]:
-        if c in df.columns:
-            df[c] = _safe_numeric(df[c], default=0.0)
-            sort_cols.append(c)
-            ascending.append(False)
-            break
-
-    for c in ["pseudobulk_center", "center_value"]:
-        if c in df.columns:
-            df[c] = _safe_numeric(df[c], default=0.0)
-            sort_cols.append(c)
-            ascending.append(False)
-            break
-
-    if len(sort_cols) == 0:
-        return df.iloc[[0]].copy()
-
-    return df.sort_values(sort_cols, ascending=ascending).iloc[[0]].copy()
+    return df.sort_values(
+        ["fdr_dist", "stat", "pseudobulk_center"],
+        ascending=[True, False, False],
+    ).iloc[[0]].copy()
 
 
 def _rank_summits_for_gap_filter(summit_df):
     df = summit_df.copy()
 
-    sort_cols = []
-    ascending = []
+    df["fdr_dist"] = _safe_numeric(df["fdr_dist"], default=1.0)
+    df["stat"] = _safe_numeric(df["stat"], default=0.0)
+    df["pseudobulk_center"] = _safe_numeric(df["pseudobulk_center"], default=0.0)
 
-    for c in ["qvalue", "qval", "fdr", "FDR", "padj", "adj_pvalue"]:
-        if c in df.columns:
-            df[c] = _safe_numeric(df[c], default=1.0)
-            sort_cols.append(c)
-            ascending.append(True)
-            break
-
-    for c in ["stat", "wilcoxon_stat", "tstat", "t_stat"]:
-        if c in df.columns:
-            df[c] = _safe_numeric(df[c], default=0.0)
-            sort_cols.append(c)
-            ascending.append(False)
-            break
-
-    for c in ["pseudobulk_center", "center_value"]:
-        if c in df.columns:
-            df[c] = _safe_numeric(df[c], default=0.0)
-            sort_cols.append(c)
-            ascending.append(False)
-            break
-
-    if len(sort_cols) == 0:
-        return list(range(summit_df.shape[0]))
-
-    return df.sort_values(sort_cols, ascending=ascending).index.tolist()
+    return df.sort_values(
+        ["fdr_dist", "stat", "pseudobulk_center"],
+        ascending=[True, False, False],
+    ).index.tolist()
 
 
 def cluster_one_chrom(df, binsize, clustering_gap, summit_gap):
-    """
-    单染色体 candidate 聚类。
-
-    规则：
-      两个 candidate 的 bin 坐标 Chebyshev 距离 <= clustering_gap，
-      则归入同一 cluster。
-    """
     if df.shape[0] == 0:
         out = df.copy()
         out["cluster_id"] = []
@@ -918,9 +651,12 @@ def cluster_one_chrom(df, binsize, clustering_gap, summit_gap):
 
     df = df.copy().reset_index(drop=True)
 
-    pairs = np.asarray([_get_bin_pair(row, binsize) for _, row in df.iterrows()], dtype=np.int64)
-    n = pairs.shape[0]
+    pairs = np.asarray(
+        [_get_bin_pair(row, binsize) for _, row in df.iterrows()],
+        dtype=np.int64,
+    )
 
+    n = pairs.shape[0]
     visited = np.zeros(n, dtype=bool)
     cluster_ids = np.full(n, -1, dtype=np.int64)
 
@@ -952,7 +688,6 @@ def cluster_one_chrom(df, binsize, clustering_gap, summit_gap):
         cid += 1
 
     df["cluster_id"] = cluster_ids
-
     cluster_sizes = df.groupby("cluster_id").size().to_dict()
     df["cluster_size"] = df["cluster_id"].map(cluster_sizes).astype(int)
     df["is_summit"] = 0
@@ -965,7 +700,6 @@ def cluster_one_chrom(df, binsize, clustering_gap, summit_gap):
 
     df.loc[summit_indices, "is_summit"] = 1
 
-    # summit_gap 后处理：summit 过近时只保留排序优先级更高的
     if summit_gap is not None and int(summit_gap) > 0 and len(summit_indices) > 1:
         summit_df = df.loc[summit_indices].copy()
         summit_df = summit_df.reset_index().rename(columns={"index": "_orig_idx"})
@@ -1009,15 +743,6 @@ def cluster_candidates(
     rank=0,
     candidate_input_prefix="candidates",
 ):
-    """
-    对 candidates 或 candidates_filter 聚类。
-
-    输入：
-      {candidate_input_prefix}.{chrom}.bedpe
-
-    输出：
-      clustered.candidates.{chrom}.bedpe
-    """
     for chrom in proc_chroms:
         infile = os.path.join(outdir, f"{candidate_input_prefix}.{chrom}.bedpe")
         outfile = os.path.join(outdir, f"clustered.candidates.{chrom}.bedpe")
@@ -1050,27 +775,16 @@ def cluster_candidates(
 
         _log(
             logger,
-            f"\tprocessor {rank}: {chrom} clustered candidates={clustered.shape[0]}, summits={n_summit}",
+            f"\tprocessor {rank}: {chrom} clustered candidates={clustered.shape[0]}, "
+            f"summits={n_summit}",
             rank=rank,
             v=2,
         )
 
 
-# ============================================================
-# Compatibility hook
-# ============================================================
-
 def append_zscores(outdir, proc_chroms):
-    """
-    新 pseudocell raw-count 流程不需要 zscore。
-    保留空函数用于兼容旧接口。
-    """
     return
 
-
-# ============================================================
-# Main postprocess
-# ============================================================
 
 def postprocess(
     indir,
@@ -1110,13 +824,6 @@ def postprocess(
     support_ratio=0.5,
     pseudocell_pattern="*.bedpe*",
 ):
-    """
-    Raw pseudocell postprocess.
-
-    注意：
-      raw_sc_bedpe_dir/raw_sc_pattern 参数仅保留兼容，不再使用。
-      五类结构背景直接从 pseudobulk_hic 读取。
-    """
     if logger:
         try:
             logger.set_rank(rank)
@@ -1168,13 +875,15 @@ def postprocess(
         rank=rank,
         pseudobulk_hic=pseudobulk_hic,
         hic_normalization=hic_normalization,
+        pseudocell_dir=pseudocell_dir,
+        pseudocell_pattern=pseudocell_pattern,
     )
 
     if support_filter:
         if filter_candidate_dir_by_pseudocell_support is None:
             raise ImportError(
-                "[support] support_filter=True but src.prefilter_support.filter_candidate_dir_by_pseudocell_support "
-                "could not be imported."
+                "[support] support_filter=True but "
+                "filter_candidate_dir_by_pseudocell_support could not be imported"
             )
 
         if pseudocell_dir is None:
@@ -1227,40 +936,25 @@ def postprocess(
     append_zscores(outdir, proc_chroms)
 
 
-# ============================================================
-# Combine outputs
-# ============================================================
-
 def _read_clustered_file(path):
     try:
-        df = pd.read_csv(path, sep="\t", low_memory=False)
+        return pd.read_csv(path, sep="\t", low_memory=False)
     except pd.errors.EmptyDataError:
         return pd.DataFrame()
 
-    return df
-
 
 def combine_postprocessed_chroms(directory, prefix=None):
-    """
-    合并所有 clustered.candidates.{chrom}.bedpe。
-
-    输出：
-      {prefix}.postprocessed.all_candidates.bedpe
-      {prefix}.postprocessed.summits.bedpe
-    """
     if prefix is None:
         prefix = "pseudocell"
 
-    pattern = os.path.join(directory, "clustered.candidates.*.bedpe")
-    files = sorted(glob.glob(pattern))
+    files = sorted(glob.glob(os.path.join(directory, "clustered.candidates.*.bedpe")))
 
     all_dfs = []
 
     for fp in files:
         df = _read_clustered_file(fp)
-        if df.shape[0] == 0:
-            continue
-        all_dfs.append(df)
+        if df.shape[0] > 0:
+            all_dfs.append(df)
 
     all_candidates_file = os.path.join(directory, f"{prefix}.postprocessed.all_candidates.bedpe")
     summits_file = os.path.join(directory, f"{prefix}.postprocessed.summits.bedpe")
@@ -1272,7 +966,6 @@ def combine_postprocessed_chroms(directory, prefix=None):
         return
 
     all_df = pd.concat(all_dfs, ignore_index=True)
-
     all_df.to_csv(all_candidates_file, sep="\t", index=False)
 
     if "is_summit" in all_df.columns:
