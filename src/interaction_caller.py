@@ -102,10 +102,11 @@ def convert_sparse_dataframe_to_dense_matrix(
     """
     将 combined BEDPE + cells.hdf 分块转换为 dense matrix。
 
-    关键修改：
-    1. interaction × cell 矩阵缺失值直接补 0。
-    2. 额外生成 target_pairs_local，只对原始 union interactions 做显著性检验。
-    3. 保留 SnapHiC 中 yield 相关的中间 print。
+    当前逻辑：
+    1. 原始 combined BEDPE / HDF 只代表有读数的 interaction；文件中缺失不是“真实 0 行”。
+    2. 为计算背景，先扩展出该 block 内所有合法上三角坐标；缺失坐标在 dense matrix 中补 0。
+    3. 背景均值分母使用窗口内所有合法坐标位置，即 NaN 以外的位置；补出来的 0 纳入分母。
+    4. 仍然只对原始 union interactions，即 d_keep 中真实存在的坐标，做显著性检验。
     """
     d["i"] = (d.iloc[:, 1] // binsize).astype(int)
     d["j"] = (d.iloc[:, 4] // binsize).astype(int)
@@ -166,7 +167,10 @@ def convert_sparse_dataframe_to_dense_matrix(
         for cell_index in range(num_cells):
             cell_values = portion.iloc[:, 6 + cell_index]
 
-            # 原理上 interaction × cell 缺失直接补 0，不在检验阶段再做额外处理。
+            # 原始数据文件只保留有读数的 interaction；outer merge 产生的 NaN
+            # 表示该合法坐标在该 cell 中没有有效读数。
+            # 对背景均值而言，这类“合法位置无读数”应按 0 计入，并纳入分母；
+            # 因此这里补 0。非法位置仍在后面用下三角/边界 NaN 表示。
             cell_values = pd.to_numeric(cell_values, errors="coerce").fillna(0.0)
 
             cell_mat = sp.sparse.csr_matrix(
@@ -307,6 +311,16 @@ def get_mat_and_neighborhood(
     start_index,
     max_distance_bin,
 ):
+    """
+    计算每个中心点的 local background。
+
+    修改后的逻辑：
+    1. 背景窗口分母使用所有合法坐标命中的 interaction 位置。
+    2. 原始文件中缺失的合法坐标在 dense matrix 中已经补为 0，并纳入背景均值分母。
+    3. NaN 只表示非法位置，例如下三角、对角线或 padding 边界，不参与分母。
+    4. 如果某个中心点的背景窗口没有任何合法背景坐标，则该中心点的 local background 设为 0.0。
+    5. 显著性检验对象仍只保留原始 union interactions，不会把补出来的 0 坐标作为待检验 interaction。
+    """
     gc.collect()
 
     big_neighborhood = skimage.util.view_as_windows(
@@ -341,14 +355,29 @@ def get_mat_and_neighborhood(
         )
     )
 
-    big_neighborhood_counts = np.sum(~np.isnan(big_neighborhood), axis=-1)
-    small_neighborhood_counts = np.sum(~np.isnan(small_neighborhood), axis=-1)
+    # 背景均值分母 = 窗口内所有合法坐标位置数。
+    # 说明：
+    #   - outer merge 后缺失的合法坐标已经在 dense matrix 中补为 0，
+    #     表示该位置没有有效读数，但仍是背景窗口内的合法坐标，因此纳入分母；
+    #   - NaN 只表示非法位置，包括下三角、对角线和 padding 边界，不纳入分母。
+    big_valid = np.isfinite(big_neighborhood)
+    small_valid = np.isfinite(small_neighborhood)
+
+    big_neighborhood_counts = np.sum(big_valid, axis=-1)
+    small_neighborhood_counts = np.sum(small_valid, axis=-1)
 
     print("big:", big_neighborhood.shape)
     print("small:", small_neighborhood.shape)
 
-    big_neighborhood = np.nansum(big_neighborhood, axis=-1)
-    small_neighborhood = np.nansum(small_neighborhood, axis=-1)
+    big_neighborhood = np.sum(
+        np.where(big_valid, big_neighborhood, 0.0),
+        axis=-1,
+    )
+
+    small_neighborhood = np.sum(
+        np.where(small_valid, small_neighborhood, 0.0),
+        axis=-1,
+    )
 
     trim_size = upper_limit - lower_limit
 
@@ -386,9 +415,19 @@ def get_mat_and_neighborhood(
     del big_neighborhood
     del big_neighborhood_counts
     del small_neighborhood_counts
+    del big_valid
+    del small_valid
     gc.collect()
 
-    local_neighborhood = local_neighborhood / local_neighborhood_counts
+    # 没有任何合法背景坐标时，背景均值设为 0.0。
+    # 正常情况下，缺失但合法的坐标已补 0 并纳入分母；
+    # 这里主要是边界/极端窗口的兜底处理。
+    with np.errstate(divide="ignore", invalid="ignore"):
+        local_neighborhood = np.where(
+            local_neighborhood_counts > 0,
+            local_neighborhood / local_neighborhood_counts,
+            0.0,
+        )
 
     del local_neighborhood_counts
     gc.collect()
@@ -400,14 +439,17 @@ def _wilcoxon_vectorized(case_values, control_values):
     """
     批量 Wilcoxon signed-rank test。
 
+    保持原逻辑不变：
     case_values:
         shape = (n_interactions, n_cells)
 
     control_values:
         shape = (n_interactions, n_cells)
 
-    不在这里做 diff==0 或 NaN 清理。
-    interaction × cell 缺失已经在构建矩阵阶段补 0。
+    这里不额外清理 NaN 或 diff==0。
+    本版本中 control_values 不引入 NaN；
+    缺失但合法的背景坐标已补 0 并纳入分母，
+    没有合法背景坐标的位置在 get_mat_and_neighborhood() 中设为 0.0。
     """
     try:
         res = stats.wilcoxon(
@@ -423,8 +465,14 @@ def _wilcoxon_vectorized(case_values, control_values):
         stat = np.asarray(res.statistic, dtype=float)
         pvalue = np.asarray(res.pvalue, dtype=float)
 
+        # 与 SnapHiC 原版保持同一原则：
+        # 不可检验或全零差异产生的 NaN pvalue 不能进入 multipletests。
+        # 原版 t-test 流程中会将 NaN pvalue 替换为 1；
+        # 这里 Wilcoxon 出现 NaN 时同样按“不显著”处理。
+        stat = np.nan_to_num(stat, nan=0.0, posinf=0.0, neginf=0.0)
+        pvalue = np.nan_to_num(pvalue, nan=1.0, posinf=1.0, neginf=1.0)
+
     except Exception:
-        # 如果某些旧版 scipy 不支持 axis 参数，则明确报错，避免静默退回慢循环。
         raise RuntimeError(
             "Current scipy.stats.wilcoxon does not support vectorized axis=1. "
             "Please upgrade scipy, e.g. scipy>=1.9, or use a newer conda environment."
@@ -446,10 +494,13 @@ def compute_significances(
     """
     计算显著性。
 
-    关键修改：
-    1. 不再扫描 dense block 完整上三角。
-    2. 只对 combined BEDPE 中真实存在的 union interactions 做检验。
-    3. Wilcoxon 使用 scipy 的 axis=1 批量计算。
+    逻辑：
+    1. 只对 combined BEDPE 中真实存在的 union interactions 做检验。
+    2. case_values 是中心 interaction 在每个 cell 中的值。
+    3. control_values 是每个 cell 中该中心点背景窗口的均值。
+    4. control_values 的背景均值由背景窗口内所有合法坐标位置计算；
+       原文件缺失的合法坐标按 0 计入并纳入分母，NaN 非法位置不参与。
+    5. 检验对象仍只来自原始 union interactions；补出来的 0 坐标不会作为新的待检验 interaction。
     """
     print("in compute:", mat.shape, local_neighborhood.shape)
 
@@ -508,6 +559,28 @@ def compute_significances(
     result = result[result["j"] - result["i"] <= max_distance_bin]
 
     return result
+
+
+def _bh_fdr_safe(pvalues):
+    """
+    Benjamini-Hochberg FDR correction with SnapHiC-compatible NaN handling.
+
+    SnapHiC 原版在 t-test 后将 NaN pvalue 置为 1，再做：
+        1. distance-stratified BH-FDR -> fdr_dist
+        2. chromosome-wide BH-FDR    -> fdr_chrom
+
+    pseudocell 这里使用 Wilcoxon，某些全零差异或不可检验情况会产生 NaN。
+    如果不先将 NaN pvalue 置为 1，statsmodels.multipletests 可能输出 NaN，
+    保存到 TSV 后就表现为 fdr_chrom 空值。
+    """
+    p = pd.to_numeric(pd.Series(pvalues), errors="coerce").fillna(1.0).to_numpy(dtype=float)
+    p = np.nan_to_num(p, nan=1.0, posinf=1.0, neginf=1.0)
+    p = np.clip(p, 0.0, 1.0)
+
+    if p.size == 0:
+        return np.array([], dtype=float)
+
+    return multipletests(p, method="fdr_bh")[1]
 
 
 def _standardize_combined_columns(d):
@@ -705,10 +778,29 @@ def call_interactions(
             )
             continue
 
+        # ============================================================
+        # FDR correction, same correction logic as original SnapHiC:
+        #   fdr_dist  : BH-FDR within each genomic-distance stratum
+        #   fdr_chrom : BH-FDR across all tested interactions on this chromosome
+        #
+        # Important fix:
+        #   Wilcoxon may produce NaN pvalue for all-zero / non-testable pairs.
+        #   SnapHiC's t-test path replaces NaN pvalue by 1 before FDR correction.
+        #   Here we do the same; otherwise fdr_chrom may be written as empty.
+        # ============================================================
+        results = results.copy()
+        results["pvalue"] = pd.to_numeric(results["pvalue"], errors="coerce").fillna(1.0)
+        results["pvalue"] = np.nan_to_num(
+            results["pvalue"].to_numpy(dtype=float),
+            nan=1.0,
+            posinf=1.0,
+            neginf=1.0,
+        )
+        results["pvalue"] = np.clip(results["pvalue"], 0.0, 1.0)
+
         def compute_fdr_by_dist(dsub):
             dsub = dsub.copy()
-            fdrs = multipletests(list(dsub["pvalue"]), method="fdr_bh")[1]
-            dsub.loc[:, "fdr_dist"] = fdrs
+            dsub.loc[:, "fdr_dist"] = _bh_fdr_safe(dsub["pvalue"])
             return dsub
 
         results.reset_index(drop=True, inplace=True)
@@ -718,10 +810,7 @@ def call_interactions(
             group_keys=False,
         ).apply(compute_fdr_by_dist)
 
-        results.loc[:, "fdr_chrom"] = multipletests(
-            list(results["pvalue"]),
-            method="fdr_bh",
-        )[1]
+        results.loc[:, "fdr_chrom"] = _bh_fdr_safe(results["pvalue"])
 
         results.loc[:, "i"] = (results["i"] * binsize).astype(int)
         results.loc[:, "j"] = (results["j"] * binsize).astype(int)
@@ -736,6 +825,12 @@ def call_interactions(
         )
 
         d_out.drop(["i", "j"], axis=1, inplace=True)
+
+        # 最后再兜底一次，确保输出 TSV 中 fdr_dist/fdr_chrom 不是空值。
+        d_out["pvalue"] = pd.to_numeric(d_out["pvalue"], errors="coerce").fillna(1.0)
+        d_out["stat"] = pd.to_numeric(d_out["stat"], errors="coerce").fillna(0.0)
+        d_out["fdr_dist"] = pd.to_numeric(d_out["fdr_dist"], errors="coerce").fillna(1.0)
+        d_out["fdr_chrom"] = pd.to_numeric(d_out["fdr_chrom"], errors="coerce").fillna(1.0)
 
         d_out = d_out[
             [

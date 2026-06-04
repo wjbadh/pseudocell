@@ -185,8 +185,6 @@ def load_hic_contact_map(
     )
 
     try:
-        # 当前环境 hicstraw 的正确顺序：
-        # straw(observed/oe/expected, normalization, hic, chr1, chr2, BP/FRAG, binsize)
         records = hicstraw.straw(
             "observed",
             str(normalization),
@@ -244,6 +242,17 @@ def get_contact_value(contact_map, i, j):
 
 
 def compute_structural_backgrounds_for_pair(contact_map, i, j, gap_large, gap_small):
+    """
+    计算 pseudobulk .hic 的五类结构背景。
+
+    当前逻辑：
+    1. 背景窗口内所有合法坐标都参与背景均值计算。
+    2. 合法坐标是指：bin 坐标非负，并且位于上三角 a < b。
+    3. 如果合法坐标在 .hic contact_map 中缺失，get_contact_value() 返回 0.0，
+       该 0.0 会被加入 vals，并计入分母。
+    4. NaN/非法坐标不参与分母。
+    5. 如果某一类背景没有任何合法坐标，则该背景均值设为 0.0。
+    """
     i = int(i)
     j = int(j)
 
@@ -259,6 +268,24 @@ def compute_structural_backgrounds_for_pair(contact_map, i, j, gap_large, gap_sm
     horizontal_vals = []
     vertical_vals = []
 
+    def append_if_valid(vals, a, b):
+        """
+        合法坐标缺失 contact 时按 0.0 处理并纳入分母；
+        非法坐标不纳入分母。
+        """
+        a = int(a)
+        b = int(b)
+
+        if a < 0 or b < 0 or a >= b:
+            return
+
+        v = get_contact_value(contact_map, a, b)
+
+        if np.isfinite(v):
+            vals.append(float(v))
+
+    # circle/donut：中心周围的大方框去掉中心小方框。
+    # 这里保留原脚本含义：circle 与 donut 使用同一组背景坐标。
     for di in range(-gl, gl + 1):
         for dj in range(-gl, gl + 1):
             if abs(di) <= gs and abs(dj) <= gs:
@@ -267,51 +294,37 @@ def compute_structural_backgrounds_for_pair(contact_map, i, j, gap_large, gap_sm
             a = i + di
             b = j + dj
 
-            if a < 0 or b < 0 or a >= b:
-                continue
+            before_len = len(circle_vals)
+            append_if_valid(circle_vals, a, b)
+            if len(circle_vals) > before_len:
+                donut_vals.append(circle_vals[-1])
 
-            v = get_contact_value(contact_map, a, b)
-            circle_vals.append(v)
-            donut_vals.append(v)
-
+    # lower_left：沿左下方向的对角背景。
     for d in range(gs + 1, gl + 1):
-        a = i - d
-        b = j - d
+        append_if_valid(lower_left_vals, i - d, j - d)
 
-        if a >= 0 and b >= 0 and a < b:
-            lower_left_vals.append(get_contact_value(contact_map, a, b))
-
+    # horizontal：固定左端点，横向移动右端点。
     for dj in range(-gl, gl + 1):
         if abs(dj) <= gs:
             continue
+        append_if_valid(horizontal_vals, i, j + dj)
 
-        a = i
-        b = j + dj
-
-        if a >= 0 and b >= 0 and a < b:
-            horizontal_vals.append(get_contact_value(contact_map, a, b))
-
+    # vertical：移动左端点，固定右端点。
     for di in range(-gl, gl + 1):
         if abs(di) <= gs:
             continue
+        append_if_valid(vertical_vals, i + di, j)
 
-        a = i + di
-        b = j
-
-        if a >= 0 and b >= 0 and a < b:
-            vertical_vals.append(get_contact_value(contact_map, a, b))
-
-    def mean0(vals):
+    def mean_or_zero(vals):
         return float(np.mean(vals)) if len(vals) > 0 else 0.0
 
     return (
-        mean0(circle_vals),
-        mean0(donut_vals),
-        mean0(lower_left_vals),
-        mean0(horizontal_vals),
-        mean0(vertical_vals),
+        mean_or_zero(circle_vals),
+        mean_or_zero(donut_vals),
+        mean_or_zero(lower_left_vals),
+        mean_or_zero(horizontal_vals),
+        mean_or_zero(vertical_vals),
     )
-
 
 def add_structural_background_columns_from_hic(
     df,
@@ -690,6 +703,13 @@ def cluster_one_chrom(df, binsize, clustering_gap, summit_gap):
     df["cluster_id"] = cluster_ids
     cluster_sizes = df.groupby("cluster_id").size().to_dict()
     df["cluster_size"] = df["cluster_id"].map(cluster_sizes).astype(int)
+
+    # df = df[df["cluster_size"] > 1].copy().reset_index(drop=True)
+
+    if df.shape[0] == 0:
+        df["is_summit"] = []
+        return df
+
     df["is_summit"] = 0
 
     summit_indices = []

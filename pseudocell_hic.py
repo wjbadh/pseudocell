@@ -50,11 +50,6 @@ def main():
 
     validate_args(args)
 
-    if args.make_hic:
-        args.no_hic = False
-    if args.make_cool:
-        args.no_cool = False
-
     if args.summit_gap == -1:
         args.summit_gap = 2 * args.binsize
 
@@ -537,9 +532,7 @@ def create_parser():
     parser.add_argument("--verbose", type=int, default=0)
 
     parser.add_argument("--no-hic", action="store_true", default=True)
-    parser.add_argument("--make-hic", action="store_true", default=False)
     parser.add_argument("--no-cool", action="store_true", default=True)
-    parser.add_argument("--make-cool", action="store_true", default=False)
 
     return parser
 
