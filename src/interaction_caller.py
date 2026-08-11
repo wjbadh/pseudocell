@@ -435,50 +435,73 @@ def get_mat_and_neighborhood(
     return mat, local_neighborhood
 
 
-def _wilcoxon_vectorized(case_values, control_values):
+def _wilcoxon_vectorized(case_values, control_values, chunk_size=50000):
     """
     批量 Wilcoxon signed-rank test。
 
-    保持原逻辑不变：
-    case_values:
-        shape = (n_interactions, n_cells)
-
-    control_values:
-        shape = (n_interactions, n_cells)
-
-    这里不额外清理 NaN 或 diff==0。
-    本版本中 control_values 不引入 NaN；
-    缺失但合法的背景坐标已补 0 并纳入分母，
-    没有合法背景坐标的位置在 get_mat_and_neighborhood() 中设为 0.0。
+    关键修改：
+    1. 不再使用 mode="auto"，避免 N 较小时 SciPy 走 exact/permutation 路径。
+    2. 强制使用近似法 approx/asymptotic，避免 permutation_test 申请巨大临时数组。
+    3. 按 interaction 分块计算，避免一次性对几十万 interaction 做 Wilcoxon。
+    4. NaN pvalue 仍按“不显著”处理，即 pvalue=1、stat=0。
     """
-    try:
-        res = stats.wilcoxon(
-            case_values,
-            control_values,
-            axis=1,
-            alternative="greater",
-            zero_method="wilcox",
-            correction=False,
-            mode="auto",
+    case_values = np.asarray(case_values, dtype=float)
+    control_values = np.asarray(control_values, dtype=float)
+
+    if case_values.shape != control_values.shape:
+        raise ValueError(
+            f"case_values and control_values must have the same shape, "
+            f"got {case_values.shape} and {control_values.shape}"
         )
+
+    n_interactions = case_values.shape[0]
+
+    stat_all = np.zeros(n_interactions, dtype=float)
+    pvalue_all = np.ones(n_interactions, dtype=float)
+
+    for start in range(0, n_interactions, chunk_size):
+        end = min(start + chunk_size, n_interactions)
+
+        x = case_values[start:end, :]
+        y = control_values[start:end, :]
+
+        try:
+            # 兼容较新的 SciPy：method="approx"
+            res = stats.wilcoxon(
+                x,
+                y,
+                axis=1,
+                alternative="greater",
+                zero_method="wilcox",
+                correction=False,
+                method="approx",
+            )
+        except TypeError:
+            # 兼容较旧 SciPy：mode="approx"
+            res = stats.wilcoxon(
+                x,
+                y,
+                axis=1,
+                alternative="greater",
+                zero_method="wilcox",
+                correction=False,
+                mode="approx",
+            )
+        except ValueError:
+            # 某些全零差异或不可检验行可能触发 ValueError。
+            # 这些 interaction 直接视为不显著。
+            continue
 
         stat = np.asarray(res.statistic, dtype=float)
         pvalue = np.asarray(res.pvalue, dtype=float)
 
-        # 与 SnapHiC 原版保持同一原则：
-        # 不可检验或全零差异产生的 NaN pvalue 不能进入 multipletests。
-        # 原版 t-test 流程中会将 NaN pvalue 替换为 1；
-        # 这里 Wilcoxon 出现 NaN 时同样按“不显著”处理。
         stat = np.nan_to_num(stat, nan=0.0, posinf=0.0, neginf=0.0)
         pvalue = np.nan_to_num(pvalue, nan=1.0, posinf=1.0, neginf=1.0)
 
-    except Exception:
-        raise RuntimeError(
-            "Current scipy.stats.wilcoxon does not support vectorized axis=1. "
-            "Please upgrade scipy, e.g. scipy>=1.9, or use a newer conda environment."
-        )
+        stat_all[start:end] = stat
+        pvalue_all[start:end] = pvalue
 
-    return stat, pvalue
+    return stat_all, pvalue_all
 
 
 def compute_significances(

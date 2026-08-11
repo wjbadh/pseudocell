@@ -35,19 +35,46 @@ import argparse
 import os
 import multiprocessing
 
-from src.combine_cells import combine_cells, combine_chrom_hic
+from src.combine_cells import (
+    combine_cells,
+    combine_chrom_hic,
+    compute_min_contact_count_by_distance,
+)
 from src.interaction_caller import call_interactions, combine_chrom_interactions
 from src.postprocess import postprocess, combine_postprocessed_chroms
 import src.logger
 
 
 VALID_STEPS = {"hic", "interaction", "postprocess"}
+DEFAULT_MIN_CONTACT_FOLDCHANGE = 2.0
+
+
+def parse_min_contact_count(value):
+    """Accept a positive number or the literal 'auto'."""
+    if str(value).strip().lower() == "auto":
+        return None
+    try:
+        parsed = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "--min-contact-count must be a positive number or 'auto'"
+        ) from exc
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("--min-contact-count must be > 0")
+    return parsed
+
+
+def resolve_contact_threshold_mode(args):
+    """Resolve the default mode after argparse has enforced mutual exclusion."""
+    if args.min_contact_count is None and args.min_contact_foldchange is None:
+        args.min_contact_foldchange = DEFAULT_MIN_CONTACT_FOLDCHANGE
 
 
 def main():
     parser = create_parser()
     args = parser.parse_args()
 
+    resolve_contact_threshold_mode(args)
     validate_args(args)
 
     if args.summit_gap == -1:
@@ -91,6 +118,44 @@ def main():
     interaction_dir = os.path.join(args.outdir, "interactions")
     postproc_dir = os.path.join(args.outdir, "postprocessed")
 
+    distance_thresholds = None
+    if "hic" in args.steps and args.min_contact_count is None:
+        threshold_summary = None
+        if parallel_mode == "parallel":
+            comm = parallel_properties["comm"]
+            if rank == 0:
+                distance_thresholds, threshold_summary = compute_min_contact_count_by_distance(
+                    pseudobulk_hic=args.pseudobulk_hic,
+                    chroms=list(chrom_dict),
+                    binsize=args.binsize,
+                    hic_normalization="NONE",
+                    max_distance=args.dist,
+                    multiplier=args.min_contact_foldchange,
+                    logger=logger,
+                    rank=rank,
+                )
+            distance_thresholds = comm.bcast(distance_thresholds, root=0)
+            comm.Barrier()
+        else:
+            distance_thresholds, threshold_summary = compute_min_contact_count_by_distance(
+                pseudobulk_hic=args.pseudobulk_hic,
+                chroms=list(chrom_dict),
+                binsize=args.binsize,
+                hic_normalization="NONE",
+                max_distance=args.dist,
+                multiplier=args.min_contact_foldchange,
+                logger=logger,
+                rank=rank,
+            )
+
+        if rank == 0:
+            os.makedirs(hic_dir, exist_ok=True)
+            threshold_summary.to_csv(
+                os.path.join(hic_dir, "min_contact_count_by_distance.tsv"),
+                sep="\t",
+                index=False,
+            )
+
     # ------------------------------------------------------------
     # step 1: hic
     # ------------------------------------------------------------
@@ -112,6 +177,11 @@ def main():
                 min_contact_count=args.min_contact_count,
                 binsize=args.binsize,
                 input_pattern=args.pseudocell_pattern,
+                pseudobulk_hic=args.pseudobulk_hic,
+                hic_normalization="NONE",
+                union_max_distance=args.dist,
+                distance_thresholds=distance_thresholds,
+                min_contact_foldchange=args.min_contact_foldchange,
             )
 
             if parallel_mode == "parallel":
@@ -130,10 +200,15 @@ def main():
                     args.min_contact_count,
                     args.binsize,
                     args.pseudocell_pattern,
+                    args.pseudobulk_hic,
+                    "NONE",
+                    None,
+                    args.dist,
+                    distance_thresholds,
+                    args.min_contact_foldchange,
                 )
                 for i in range(n_proc)
             ]
-
             with multiprocessing.Pool(n_proc) as pool:
                 pool.starmap(combine_cells, params)
 
@@ -335,6 +410,15 @@ def validate_args(args):
     if "postprocess" in args.steps and args.pseudobulk_hic is None:
         raise ValueError("--pseudobulk-hic is required when postprocess step is enabled")
 
+    if args.min_contact_count is not None and args.min_contact_count <= 0:
+        raise ValueError("--min-contact-count must be > 0 or 'auto'")
+
+    if args.min_contact_foldchange is not None and args.min_contact_foldchange <= 0:
+        raise ValueError("--min-contact-foldchange must be > 0")
+
+    if not 0 <= args.min_support_fraction <= 1:
+        raise ValueError("--min-support-fraction must be between 0 and 1")
+
     if args.support_radius_bins < 0:
         raise ValueError("--support-radius-bins must be >= 0")
 
@@ -466,18 +550,35 @@ def create_parser():
     parser.add_argument("--dist", type=int, default=2_000_000)
     parser.add_argument("--binsize", type=int, default=10_000)
 
-    parser.add_argument(
+    contact_group = parser.add_mutually_exclusive_group()
+    contact_group.add_argument(
         "--min-contact-count",
+        type=parse_min_contact_count,
+        default=None,
+        metavar="COUNT|auto",
+        help=(
+            "Use one fixed positive raw-count threshold for every distance. "
+            "The legacy value 'auto' selects distance-specific mode with the default "
+            "--min-contact-foldchange of 2.0."
+        ),
+    )
+    contact_group.add_argument(
+        "--min-contact-foldchange",
         type=float,
-        default=1,
-        help="Minimum raw count retained in hic/combine step.",
+        default=None,
+        metavar="FLOAT",
+        help=(
+            "For each exact genomic distance, set the raw-count threshold to FLOAT x "
+            "the median nonzero observed count at that distance in --pseudobulk-hic. "
+            "Default: 2.0 when neither threshold option is supplied."
+        ),
     )
 
     parser.add_argument(
         "--min-support-fraction",
         type=float,
-        default=0.05,
-        help="Minimum fraction of pseudocells with nonzero center interaction in interaction/postprocess filtering.",
+        default=0.1,
+        help="Minimum fraction of pseudocells supporting the center interaction (default: 0.1).",
     )
 
     parser.add_argument(

@@ -856,7 +856,7 @@ def postprocess(
         stat_threshold = 0.0 if tstat_threshold is None else tstat_threshold
 
     if min_support_fraction is None:
-        min_support_fraction = 0.0 if outlier_threshold_mult is None else outlier_threshold_mult
+        min_support_fraction = 0.1 if outlier_threshold_mult is None else outlier_threshold_mult
 
     if pseudobulk_hic is None:
         raise ValueError("[postprocess] --pseudobulk-hic is required")
